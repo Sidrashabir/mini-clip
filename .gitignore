@@ -1,0 +1,9 @@
+.venv/
+data/
+cache/
+runs/
+model/
+my_gallery/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
