@@ -212,38 +212,48 @@ async function loadData() {
 const hasBad = (a) => { for (let i = 0; i < a.length; i++) if (!Number.isFinite(a[i])) return true; return false; };
 let precisionUsed = "";
 
-async function loadTextModel() {
-  setStatus("Loading the language model (saved by your browser after the first visit)…", 0);
-  const mod = await import(TRANSFORMERS_URL);
-  mod.env.allowLocalModels = false;
-  const files = {};
-  const progress = (p) => {
-    if (p.status === "progress" && p.total) {
-      files[p.file] = [p.loaded, p.total];
-      const [l, t] = Object.values(files).reduce((a, [x, y]) => [a[0] + x, a[1] + y], [0, 0]);
-      setStatus(`Loading the language model… ${Math.round(100 * l / t)}%`, l / t);
-    }
-  };
-  // Quantized models are small but can return NaN in some browsers, so each precision is tested
-  // on a sentence before it is used, falling back to a more precise version if needed.
-  const asked = new URLSearchParams(location.search).get("precision");
-  const order = asked ? [asked] : ["q8", "fp16", "fp32"];
-  const problems = [];
-  for (const dtype of order) {
+let tf = null, precisionOrder = [], precisionIndex = -1;
+const progressFiles = {};
+const onProgress = (p) => {
+  if (p.status === "progress" && p.total) {
+    progressFiles[p.file] = [p.loaded, p.total];
+    const [l, t] = Object.values(progressFiles).reduce((a, [x, y]) => [a[0] + x, a[1] + y], [0, 0]);
+    setStatus(`Loading the language model… ${Math.round(100 * l / t)}%`, l / t);
+  }
+};
+
+// Reduced-precision models are smaller but can return NaN for some sentences in some browsers.
+// Each one is tested on several sentences, and the page moves to a more precise version whenever
+// a test, or later a real search, produces invalid numbers.
+async function loadNextPrecision() {
+  while (++precisionIndex < precisionOrder.length) {
+    const dtype = precisionOrder[precisionIndex];
     try {
-      const ex = await mod.pipeline("feature-extraction", D.browser_text_model, { dtype, progress_callback: progress });
-      const probe = await ex(["a photo of a dog"], { pooling: "mean", normalize: false });
-      if (hasBad(probe.data)) throw new Error("returned NaN values");
-      extractor = ex; precisionUsed = dtype;
+      setStatus(precisionIndex === 0 ? "Loading the language model (saved by your browser after the first visit)…"
+        : `Switching to a more precise language model (${dtype})…`, 0);
+      extractor = await tf.pipeline("feature-extraction", D.browser_text_model, { dtype, progress_callback: onProgress });
+      precisionUsed = dtype;
+      const probe = [...D.checks.map(c => c.text), ...(D.examples || DEFAULT_EXAMPLES)];
+      for (const t of probe) {
+        const out = await extractor([t], { pooling: "mean", normalize: false });
+        if (hasBad(out.data)) throw new Error(`returned NaN values for "${t}"`);
+      }
       console.info(`Language model ready (${dtype})`);
-      return;
+      return true;
     } catch (e) {
       console.warn(`Language model (${dtype}) not usable:`, e);
-      problems.push(`${dtype}: ${e.message || e}`);
-      if (dtype !== order[order.length - 1]) setStatus(`The ${dtype} model didn't work in this browser, trying a more precise version…`, 0);
+      extractor = null;
     }
   }
-  throw new Error("the language model could not run in this browser (" + problems.join("; ") + ")");
+  return false;
+}
+
+async function loadTextModel() {
+  tf = await import(TRANSFORMERS_URL);
+  tf.env.allowLocalModels = false;
+  const asked = new URLSearchParams(location.search).get("precision");
+  precisionOrder = asked ? [asked] : ["q8", "fp16", "fp32"];
+  if (!await loadNextPrecision()) throw new Error("the language model could not run correctly in this browser");
 }
 
 // ---------------------------------------------------------------- model maths
@@ -277,10 +287,22 @@ function textHead(feat) {  // ProjectionHead: LayerNorm(h + MLP(h)), h = Linear(
   return normalize(z.map((v, i) => (v - mean) * inv * head["norm.weight"][i] + head["norm.bias"][i]));
 }
 async function embedTexts(texts) {
-  const out = await extractor(texts, { pooling: "mean", normalize: false });
-  const dim = out.dims[out.dims.length - 1];
-  const embs = texts.map((_, r) => textHead(Float32Array.from(out.data.slice(r * dim, (r + 1) * dim))));
-  if (embs.some(hasBad)) throw new Error("the language model returned invalid numbers. Reload the page, or open it with ?precision=fp32");
+  // One sentence at a time: no padding, which avoids NaN in reduced-precision models.
+  const embs = [];
+  for (const t of texts) {
+    let emb = null;
+    while (!emb) {
+      const out = await extractor([t], { pooling: "mean", normalize: false });
+      const dim = out.dims[out.dims.length - 1];
+      const e = textHead(Float32Array.from(out.data.slice(0, dim)));
+      if (!hasBad(e)) { emb = e; break; }
+      console.warn(`Invalid embedding for "${t}" with ${precisionUsed}; trying a more precise model`);
+      if (!await loadNextPrecision())
+        throw new Error("the language model returned invalid numbers in this browser. Try another browser, such as Chrome or Edge");
+      setTimeout(async () => renderAbout(await modelCheck()), 0);   // refresh the check for the new model
+    }
+    embs.push(emb);
+  }
   return embs;
 }
 function dotRow(M, i, v) { let s = 0; const o = i * DIM; for (let k = 0; k < DIM; k++) s += M[o + k] * v[k]; return s; }
