@@ -198,13 +198,22 @@ function section(buf, name) {
 async function loadData() {
   const [data, buf] = await Promise.all([fetch("data.json").then(r => r.json()), fetch("model.bin").then(r => r.arrayBuffer())]);
   D = data; N = D.items.length; DIM = D.model_cfg.embed_dim;
+  const expected = Object.values(D.sections).reduce((m, s) =>
+    Math.max(m, s.offset + s.shape.reduce((a, b) => a * b, 1) * (s.dtype === "f16" ? 2 : 4)), 0);
+  if (buf.byteLength !== expected)
+    throw new Error("docs/model.bin is damaged or doesn't match data.json. Run export_web.py again and push both files");
   imgEmb = section(buf, "image_emb"); capEmb = section(buf, "caption_emb");
   for (const k of ["proj.weight", "proj.bias", "mlp.1.weight", "mlp.1.bias", "norm.weight", "norm.bias"])
     head[k] = section(buf, "text_head." + k);
+  if (hasBad(imgEmb) || Object.values(head).some(hasBad))
+    throw new Error("docs/model.bin is damaged or doesn't match data.json. Run export_web.py again and push both files");
 }
 
+const hasBad = (a) => { for (let i = 0; i < a.length; i++) if (!Number.isFinite(a[i])) return true; return false; };
+let precisionUsed = "";
+
 async function loadTextModel() {
-  setStatus("Loading the language model (about 70 MB, saved by your browser after the first visit)…", 0);
+  setStatus("Loading the language model (saved by your browser after the first visit)…", 0);
   const mod = await import(TRANSFORMERS_URL);
   mod.env.allowLocalModels = false;
   const files = {};
@@ -215,12 +224,26 @@ async function loadTextModel() {
       setStatus(`Loading the language model… ${Math.round(100 * l / t)}%`, l / t);
     }
   };
-  const precision = new URLSearchParams(location.search).get("precision") || "q8";
-  try {
-    extractor = await mod.pipeline("feature-extraction", D.browser_text_model, { dtype: precision, progress_callback: progress });
-  } catch (e) {
-    extractor = await mod.pipeline("feature-extraction", D.browser_text_model, { dtype: "fp32", progress_callback: progress });
+  // Quantized models are small but can return NaN in some browsers, so each precision is tested
+  // on a sentence before it is used, falling back to a more precise version if needed.
+  const asked = new URLSearchParams(location.search).get("precision");
+  const order = asked ? [asked] : ["q8", "fp16", "fp32"];
+  const problems = [];
+  for (const dtype of order) {
+    try {
+      const ex = await mod.pipeline("feature-extraction", D.browser_text_model, { dtype, progress_callback: progress });
+      const probe = await ex(["a photo of a dog"], { pooling: "mean", normalize: false });
+      if (hasBad(probe.data)) throw new Error("returned NaN values");
+      extractor = ex; precisionUsed = dtype;
+      console.info(`Language model ready (${dtype})`);
+      return;
+    } catch (e) {
+      console.warn(`Language model (${dtype}) not usable:`, e);
+      problems.push(`${dtype}: ${e.message || e}`);
+      if (dtype !== order[order.length - 1]) setStatus(`The ${dtype} model didn't work in this browser, trying a more precise version…`, 0);
+    }
   }
+  throw new Error("the language model could not run in this browser (" + problems.join("; ") + ")");
 }
 
 // ---------------------------------------------------------------- model maths
@@ -256,7 +279,9 @@ function textHead(feat) {  // ProjectionHead: LayerNorm(h + MLP(h)), h = Linear(
 async function embedTexts(texts) {
   const out = await extractor(texts, { pooling: "mean", normalize: false });
   const dim = out.dims[out.dims.length - 1];
-  return texts.map((_, r) => textHead(Float32Array.from(out.data.slice(r * dim, (r + 1) * dim))));
+  const embs = texts.map((_, r) => textHead(Float32Array.from(out.data.slice(r * dim, (r + 1) * dim))));
+  if (embs.some(hasBad)) throw new Error("the language model returned invalid numbers. Reload the page, or open it with ?precision=fp32");
+  return embs;
 }
 function dotRow(M, i, v) { let s = 0; const o = i * DIM; for (let k = 0; k < DIM; k++) s += M[o + k] * v[k]; return s; }
 function rank(M, rows, v, k, skip = -1) {
@@ -296,7 +321,8 @@ async function search(q) {
   lastQuery = q; $("q").value = q;
   setStatus(`Searching ${N.toLocaleString()} photos…`);
   const t0 = performance.now();
-  const [v] = await embedTexts([q]);
+  let v;
+  try { [v] = await embedTexts([q]); } catch (e) { setStatus(`<span class="err">${escapeHtml(e.message)}</span>`); return; }
   const top = rank(imgEmb, N, v, 24);
   showGrid(top);
   setStatus(`Top 24 of ${N.toLocaleString()} photos for “${q}” · ${Math.round(performance.now() - t0)} ms · click a photo to see why it matched`);
@@ -422,11 +448,12 @@ function renderAbout(check) {
       image-region explanations): <a href="${D.repo}" target="_blank" rel="noopener">GitHub</a>.</p>`;
 }
 async function modelCheck() {
-  const embs = await embedTexts(D.checks.map(c => c.text));
+  let embs;
+  try { embs = await embedTexts(D.checks.map(c => c.text)); } catch (e) { return `⚠ ${escapeHtml(e.message)}`; }
   const cos = embs.map((e, k) => e.reduce((a, v, j) => a + v * D.checks[k].embedding[j], 0));
   const worst = Math.min(...cos);
   return worst > 0.98
-    ? `✓ The in-browser text tower matches the Python model (lowest cosine similarity on ${cos.length} test sentences: ${worst.toFixed(4)}).`
+    ? `✓ The in-browser text tower (${precisionUsed} precision) matches the Python model (lowest cosine similarity on ${cos.length} test sentences: ${worst.toFixed(4)}).`
     : `⚠ The in-browser text tower differs from the Python model (cosine ${worst.toFixed(4)}). Try <a href="?precision=fp32">full precision</a>.`;
 }
 
@@ -461,7 +488,7 @@ try {
   renderAbout(await modelCheck());
 } catch (err) {
   console.error(err);
-  setStatus(`<span class="err">Couldn't load ${extractor ? "the search" : D ? "the language model" : "the photo collection"}:
+  setStatus(`<span class="err">Couldn't start the search:
     ${escapeHtml(String(err.message || err))}.</span> You can still browse the photos and the embedding map.`);
 }
 </script>
